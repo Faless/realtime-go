@@ -1,12 +1,15 @@
 package realtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,7 +18,8 @@ import (
 )
 
 type RealtimeClient struct {
-   Url               string
+   WebsocketUrl      string
+   BroadcastUrl      string
    ApiKey            string
 
    mu                sync.Mutex
@@ -33,15 +37,21 @@ type RealtimeClient struct {
 
 // Create a new RealtimeClient with user's speicfications
 func CreateRealtimeClient(projectRef string, apiKey string) *RealtimeClient {
-   realtimeUrl := fmt.Sprintf(
+   websocketUrl := fmt.Sprintf(
       "wss://%s.supabase.co/realtime/v1/websocket?apikey=%s&log_level=info&vsn=1.0.0",
+      projectRef,
+      apiKey,
+   )
+   broadcastUrl := fmt.Sprintf(
+      "https://%s.supabase.co/realtime/v1/api/broadcast?apikey=%s&log_level=info&vsn=1.0.0",
       projectRef,
       apiKey,
    )
    newLogger := log.Default()
 
    return &RealtimeClient{
-      Url: realtimeUrl,
+      WebsocketUrl: websocketUrl,
+      BroadcastUrl: broadcastUrl,
       ApiKey: apiKey,
       logger: newLogger,
       dialTimeout: 10 * time.Second,
@@ -69,6 +79,11 @@ func (client *RealtimeClient) Connect() error {
       close(client.closed)
       return fmt.Errorf("Cannot connect to the server: %w", err)
    }
+
+   // client is only alive after the connection has been made
+   client.mu.Lock()
+   client.closed = make(chan struct{})
+   client.mu.Unlock()
 
    go client.startHeartbeats()
    go client.startListening()
@@ -138,6 +153,46 @@ func (client *RealtimeClient) unsubscribe(topic string, ctx context.Context) {
    if err != nil {
       fmt.Printf("Unexpected error: %v", err)
    }
+}
+
+// Send an event to the server through:
+// - POST request if there is no socket connection
+// - Socket if there is a socket connection
+func (client *RealtimeClient) send(msg *Msg, hasSubscribed bool, ctx context.Context) error {
+   // Send event through socket
+   if hasSubscribed {
+      err := wsjson.Write(ctx, client.conn, msg)
+      if err != nil {
+         return fmt.Errorf("Unable to send the connection message: %v", err)
+      }
+      return nil  
+   } 
+
+   // Send event through POST request
+   msg.Topic = strings.Replace(msg.Topic, "realtime:", "", 1)
+   body := struct{
+      Messages []any `json:"messages"`
+   }{
+      Messages: []any{msg},
+   }
+   bodyJson, err := json.Marshal(body)
+   if err != nil {
+      return fmt.Errorf("Failed to generate POST body: %v", err)
+   }
+
+   req, err := http.NewRequest("POST", client.BroadcastUrl, bytes.NewBuffer(bodyJson))
+   req.Header.Add("Content-Type", "application/json")
+   req.Header.Add("apikey", client.ApiKey)
+   httpClient := &http.Client{}
+   res, err := httpClient.Do(req)
+
+   if err != nil {
+      return fmt.Errorf("Failed to send POST reqest: %v", err)
+   } else if res.StatusCode != http.StatusAccepted {
+      return fmt.Errorf("POST request failed with status: %v", res.StatusCode)
+   }
+
+   return nil
 }
 
 // Create a new channel with given topic string
@@ -263,6 +318,13 @@ func (client *RealtimeClient) processMessage(msg RawMsg) {
             targetedChannel.routePostgresEvent(id, payload)
          }
          break
+      case *BroadcastPayload:
+         targetedChannel, ok := client.currentTopics[msg.Topic]
+         if !ok {
+            client.logger.Printf("Error: Unrecognized topic %v", msg.Topic)
+         }
+         targetedChannel.routeBroadcastEvent(payload)
+         break
    }
 }
 
@@ -285,6 +347,9 @@ func (client *RealtimeClient) unmarshalPayload(msg RawMsg) (any, error) {
          break
       case presenceStateEvent:
          payload = new(PresenceStatePayload)
+         break
+      case broadcastEvent:
+         payload = new(BroadcastPayload)
          break
       default:
          return struct{}{}, fmt.Errorf("Error: Unsupported event %v", msg.Event)
@@ -309,7 +374,7 @@ func (client *RealtimeClient) dialServer() error {
    ctx, cancel := context.WithTimeout(context.Background(), client.dialTimeout)
    defer cancel()
 
-   conn, _, err := websocket.Dial(ctx, client.Url, nil)
+   conn, _, err := websocket.Dial(ctx, client.WebsocketUrl, nil)
    if err != nil {
       return fmt.Errorf("Failed to dial the server: %w", err)
    }

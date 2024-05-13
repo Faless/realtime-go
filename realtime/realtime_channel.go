@@ -3,8 +3,11 @@ package realtime
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type RealtimeChannel struct {
@@ -42,7 +45,7 @@ func CreateRealtimeChannel(client *RealtimeClient, topic string) *RealtimeChanne
 func (channel *RealtimeChannel) On(eventType string, filter map[string]string, callback func(any)) error {
    eventType = strings.ToLower(eventType)
    if !verifyEventType(eventType) {
-      return fmt.Errorf("invalid event type: %s", eventType)
+      return fmt.Errorf("Invalid event type: %s", eventType)
    }
 
    eventFilter, err := createEventFilter(eventType, filter)
@@ -77,12 +80,8 @@ func (channel *RealtimeChannel) Subscribe(ctx context.Context) error {
    allBindings := make([]*binding, channel.numBindings)
    startIdx    := 0
    for _, eventType := range []string{postgresChangesEventType, broadcastEventType, presenceEventType} {
-      if startIdx >= channel.numBindings {
-         break
-      }
-
       copy(allBindings[startIdx:], channel.bindings[eventType])
-      startIdx += len(channel.bindings[eventType])
+      startIdx += len(channel.bindings)
    }
 
    respPayload, err := channel.client.subscribe(channel.topic, allBindings, ctx)
@@ -134,6 +133,26 @@ func (channel *RealtimeChannel) Unsubscribe(ctx context.Context) {
    channel.hasSubscribed = false
 }
 
+// Send a custom event to the server. Payload must be either:
+func (channel *RealtimeChannel) Send(event CustomEvent, ctx context.Context) error {
+   if !verifyEventType(event.Type) {
+      return fmt.Errorf("Invalid event type: %s", event.Type)
+   }
+
+   // Verify that payload is a struct
+   if reflect.TypeOf(event.Payload).Kind() != reflect.Struct {
+      return fmt.Errorf("Payload must be of kind Struct. Invalid payload: %+v", event.Payload)
+   }
+   
+   metadata := createMsgMetadata(event.Event, channel.topic)
+   msg := &Msg{
+      Metadata: *metadata,
+      Payload: event.Payload,
+   }
+   msg.Metadata.Ref = strconv.FormatInt(time.Now().Unix(), 10)
+   return channel.client.send(msg, channel.hasSubscribed, ctx)
+}
+
 // Route the id of triggered event to appropriate callback
 func (channel *RealtimeChannel) routePostgresEvent(id int, payload *PostgresCDCPayload) {
    channel.rwMu.RLock()
@@ -159,5 +178,27 @@ func (channel *RealtimeChannel) routePostgresEvent(id int, payload *PostgresCDCP
          break
       default:
          return 
+   }
+}
+
+// Route the broadcast event to the right callback
+func (channel *RealtimeChannel) routeBroadcastEvent(payload *BroadcastPayload) {
+   hasFound := false
+   // TODO: Instead of go through them one by one, use a hashmap to store the 
+   // broadcast bindings instead
+   for _, bind := range channel.bindings[broadcastEventType] {
+      filter, ok := bind.filter.(broadcastFilter)
+      if !ok {
+         panic("TYPE ASSERTION FAILED: expecting type broadcastFilter")
+      }
+      if filter.Event == payload.Event {
+         bind.callback(payload)
+         hasFound = true
+      }
+   }
+
+   if !hasFound {
+      channel.client.logger.Printf("Error: %+v", payload)
+      channel.client.logger.Printf("Error: Failed to find the broadcast event %v", payload.Event)
    }
 }
