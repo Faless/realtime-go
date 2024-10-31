@@ -37,10 +37,10 @@ const (
 )
 
 // type eventFilter struct {}
-type eventFilter interface {}
+type eventFilter interface{}
 
 type postgresFilter struct {
-   Event  string `supabase:"required" json:"event"`
+	Event  string `supabase:"required" json:"event"`
 	Schema string `supabase:"required" json:"schema"`
 	Table  string `supabase:"optional" json:"table,omitempty"`
 	Filter string `supabase:"optional" json:"filter,omitempty"`
@@ -56,20 +56,20 @@ type presenceFilter struct {
 
 // Custom event that can be sent to the server
 type CustomEvent struct {
-   Event    string   `json:"event"`
-   Payload  any      `json:"payload"`
-   Type     string   `json:"type"`
+	Event   string `json:"event"`
+	Payload any    `json:"payload"`
+	Type    string `json:"type"`
 }
 
 // Verify if the given event type is supported
 func verifyEventType(eventType string) bool {
 	switch eventType {
-      case presenceEventType:
-         fallthrough
-      case broadcastEventType:
-         fallthrough
-      case postgresChangesEventType:
-         return true
+	case presenceEventType:
+		fallthrough
+	case broadcastEventType:
+		fallthrough
+	case postgresChangesEventType:
+		return true
 	}
 
 	return false
